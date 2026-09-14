@@ -53,6 +53,67 @@ const HOLEPUNCH_ATTEMPTS_INTERVAL: Duration = Duration::from_secs(5);
 /// The latency at or under which we don't try to upgrade to a better path.
 const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 
+/// Upper bound on the number of distinct paths waiting for a path-open retry.
+///
+/// A remote rarely advertises more than a handful of transport addresses, so a
+/// few dozen distinct pending paths is already far more than a healthy remote
+/// produces; the cap only matters as a hard stop if something keeps minting
+/// fresh addresses.
+const MAX_PENDING_OPEN_PATHS: usize = 64;
+
+/// Paths that failed to open and are waiting for a retry.
+///
+/// Opening a path fails with [`PathError::MaxPathIdReached`] or
+/// [`PathError::RemoteCidsExhausted`] while the remote's path-id / CID budget is
+/// used up. Such an address is queued here and retried a little later on
+/// *every* connection to the remote. That fan-out is what makes the queue need
+/// a bound: with `C` connections at the cap, retrying one queued address fails
+/// `C` times and would re-queue it `C` times, so the queue multiplied by `C` on
+/// every retry tick — an exponential blow-up that has been observed to reach a
+/// single multi-GiB `VecDeque` reallocation (n0-computer/iroh#4390). An address
+/// is retried at most once per tick regardless of how many connections failed
+/// to open it, and the queue keeps only the most recent
+/// [`MAX_PENDING_OPEN_PATHS`] distinct addresses.
+#[derive(Debug, Default)]
+struct PendingOpenPaths {
+    entries: VecDeque<transports::FourTuple>,
+}
+
+impl PendingOpenPaths {
+    /// Queues `addr` for the next retry, unless it is already queued.
+    ///
+    /// When the queue is full the oldest entry is dropped: it has been failing
+    /// the longest, and the remote will re-advertise it if it still matters.
+    fn enqueue(&mut self, addr: transports::FourTuple) {
+        if self.entries.contains(&addr) {
+            return;
+        }
+        if self.entries.len() >= MAX_PENDING_OPEN_PATHS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(addr);
+    }
+
+    /// Takes every queued address, leaving the queue empty.
+    ///
+    /// Retrying an address may immediately re-queue it (via
+    /// [`Self::enqueue`]), which is why the retry loop works on the taken
+    /// queue rather than on `self`.
+    fn take(&mut self) -> VecDeque<transports::FourTuple> {
+        std::mem::take(&mut self.entries)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, addr: &transports::FourTuple) -> bool {
+        self.entries.contains(addr)
+    }
+}
+
 // TODO: use this
 // /// How long since the last activity we try to keep an established endpoint peering alive.
 // ///
@@ -158,8 +219,9 @@ struct State {
     scheduled_open_path: Option<Instant>,
     /// Paths which we still need to open.
     ///
-    /// They failed to open because we did not have enough CIDs issued by the remote.
-    pending_open_paths: VecDeque<transports::FourTuple>,
+    /// They failed to open because the remote's path-id or CID budget was used up.
+    /// Deduplicated and bounded, see [`PendingOpenPaths`].
+    pending_open_paths: PendingOpenPaths,
 
     // Internal state - address lookup
     //
@@ -198,7 +260,7 @@ impl RemoteStateActor {
                 selected_path: Default::default(),
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
-                pending_open_paths: VecDeque::new(),
+                pending_open_paths: PendingOpenPaths::default(),
                 address_lookup_stream: None,
                 path_selector,
             },
@@ -304,7 +366,7 @@ impl RemoteStateActor {
                 _ = &mut scheduled_path_open => {
                     trace!("triggering scheduled path_open");
                     self.state.scheduled_open_path = None;
-                    let mut addrs = std::mem::take(&mut self.state.pending_open_paths);
+                    let mut addrs = self.state.pending_open_paths.take();
                     while let Some(addr) = addrs.pop_front() {
                         self.open_path_on_all_conns(&addr);
                     }
@@ -1059,7 +1121,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_addr.clone());
+                        self.pending_open_paths.enqueue(open_addr.clone());
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1526,5 +1588,73 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::{MAX_PENDING_OPEN_PATHS, PendingOpenPaths};
+    use crate::socket::transports::FourTuple;
+
+    fn ip_path(port: u16) -> FourTuple {
+        FourTuple::Ip {
+            remote: SocketAddr::from(([192, 0, 2, 1], port)),
+            local: None,
+        }
+    }
+
+    /// The fan-out that caused n0-computer/iroh#4390: every retry tick attempts
+    /// each queued address on every connection to the remote, and each
+    /// connection still at its path-id cap re-queues it. With `C >= 2`
+    /// connections the queue must not multiply by `C` per tick.
+    #[test]
+    fn pending_open_paths_dedup_across_connections() {
+        let addr = ip_path(1);
+        let mut pending = PendingOpenPaths::default();
+        for _tick in 0..1_000 {
+            let drained = pending.take();
+            assert!(drained.len() <= 1);
+            for _conn_at_cap in 0..3 {
+                pending.enqueue(addr.clone());
+            }
+        }
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&addr));
+    }
+
+    /// Distinct addresses are kept up to the cap, oldest evicted first, and an
+    /// evicted address can be queued again later.
+    #[test]
+    fn pending_open_paths_capped_oldest_first() {
+        let mut pending = PendingOpenPaths::default();
+        for port in 1..=(MAX_PENDING_OPEN_PATHS as u16 + 8) {
+            pending.enqueue(ip_path(port));
+        }
+        assert_eq!(pending.len(), MAX_PENDING_OPEN_PATHS);
+        for port in 1..=8u16 {
+            assert!(
+                !pending.contains(&ip_path(port)),
+                "port {port} should be evicted"
+            );
+        }
+        assert!(pending.contains(&ip_path(9)));
+        assert!(pending.contains(&ip_path(MAX_PENDING_OPEN_PATHS as u16 + 8)));
+
+        pending.enqueue(ip_path(1));
+        assert_eq!(pending.len(), MAX_PENDING_OPEN_PATHS);
+        assert!(pending.contains(&ip_path(1)));
+        assert!(!pending.contains(&ip_path(9)));
+    }
+
+    #[test]
+    fn pending_open_paths_take_empties_queue() {
+        let mut pending = PendingOpenPaths::default();
+        pending.enqueue(ip_path(1));
+        pending.enqueue(ip_path(2));
+        let taken = pending.take();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(pending.len(), 0);
     }
 }
